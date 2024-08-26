@@ -14,19 +14,34 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-const int HX711_dout = 4; // microcontroller unit > HX711 dout pin, must be external interrupt capable!
-const int HX711_sck = 16; // microcontroller unit > HX711 sck pin
 
-// HX711 constructor:
+//Define which dout (data out) and serial data clock
+const int HX711_dout = 18; // microcontroller unit > HX711 dout pin, must be external interrupt capable!
+const int HX711_sck = 19; // microcontroller unit > HX711 sck pin
+
+const int HX711_dout_2 = 4; // microcontroller unit > HX711 dout pin, must be external interrupt capable!
+const int HX711_sck_2 = 16; // microcontroller unit > HX711 sck pin
+
+// HX711 constructor load cells:
 HX711_ADC LoadCell(HX711_dout, HX711_sck);
-float calibrationValue = 743.72;
-const int calVal_eepromAdress = 0;
+HX711_ADC LoadCell2(HX711_dout_2, HX711_sck_2);
+
+float calibrationValue = 743.72; // Calibration value for load cell 1
+float calibrationValue2 = 1733.58; // Calibration value for load cell 2
+
+
+const int calVal_eepromAdress = 0; // address for the first load cell
+const int calVal_eepromAdress2 = 10; // address for the second load cell
+
 bool useEEPROM = true;
-bool serviceEnabled = false;
+bool serviceEnabled = true;
 
 unsigned long t = 0;
 const int serialPrintInterval = 100;
+
 volatile boolean newDataReady;
+volatile boolean newDataReady2;
+
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 bool enableBootDisplay = true;
@@ -37,15 +52,21 @@ const char *password = "process_hubby";
 //const char *ssid = "FRITZ!Box 7530 BS";
 //const char *password = "09324416513504437202";
 
-IPAddress server(192, 168, 0, 118);
-const int port = 1900;
+IPAddress server(131,159,6,111); // Local address broker
+const int port = 1883; 
 const std::string sensorID = "1111";
 
 // Weight displayed on the display
 int displayedWeight = 0;
+int displayedWeight2 = 0;
+
 // Weight Measured in the previous iteration
 int lastWeight = 0;
+int lastWeight2 = 0;
+
 bool firstMeasurement = true;
+bool firstMeasurement2 = true;
+
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -69,12 +90,19 @@ void displayReconnectMessage() {
   u8g2.sendBuffer();
 }
 
-// interrupt routine:
+// interrupt routine cell 1
 void dataReadyISR()
 {
   if (LoadCell.update())
   {
     newDataReady = 1;
+  }
+}
+
+// interrupt routine cell 2
+void dataReadyISR2() {
+  if (LoadCell2.update()) {
+    newDataReady2 = 1;
   }
 }
 
@@ -84,9 +112,19 @@ void setupLoadcell()
   {
     EEPROM.begin(512);
     EEPROM.get(calVal_eepromAdress, calibrationValue);
+    //EEPROM.get(calVal_eepromAdress2, calibrationValue2);
   }
-  Serial.print("Using Calibration value:");
-  Serial.println(calibrationValue);
+  Serial.print("Using Calibration for LoadCell 1:");
+  Serial.println(calibrationValue); 
+
+  Serial.print("Using Calibration value for LoadCell 2:");
+  Serial.println(calibrationValue2);
+
+  Serial.print("Using PIN for LoadCell 2 HX711_dout_2:");
+  Serial.println(HX711_dout_2); 
+
+  Serial.print("Using PIN for LoadCell 2 HX711_sck_2:");
+  Serial.println(HX711_sck_2); 
 
   LoadCell.begin();
   unsigned long stabilizingtime = 2000;
@@ -95,16 +133,29 @@ void setupLoadcell()
   if (LoadCell.getTareTimeoutFlag())
   {
     Serial.println("Timeout, check wiring to HX711 and pin designations");
-    while (true)
-      ;
+    while (true);
   }
   else
   {
     LoadCell.setCalFactor(calibrationValue);
-    Serial.println("Startup is complete");
+    Serial.println("Loadcell 1 Startup is complete");
   }
   attachInterrupt(digitalPinToInterrupt(HX711_dout), dataReadyISR, FALLING);
+
+
+  // LoadCell2 setup
+  LoadCell2.begin();
+  LoadCell2.start(stabilizingtime, _tare);
+  if (LoadCell2.getTareTimeoutFlag()) {
+    Serial.println("Timeout, check wiring to HX711 and pin designations for LoadCell 2");
+    while (true);
+  } else {
+    LoadCell2.setCalFactor(calibrationValue2);
+    Serial.println("LoadCell 2 Startup is complete");
+  }
+  attachInterrupt(digitalPinToInterrupt(HX711_dout_2), dataReadyISR2, FALLING);
 }
+
 
 void setupDisplay()
 {
@@ -141,7 +192,7 @@ void callback(char *topic, byte *message, unsigned int length)
 void setupMQTT()
 {
   setup_wifi();
-  client.setServer(server, 1900);
+  client.setServer(server, port);
   client.setCallback(callback);
 }
 
@@ -215,8 +266,11 @@ void displayMeasuring()
 void publishWeightToMQTT()
 {
   std::string topic = "cocktail/weight/sensor_";
+  std::string topic2 = "cocktail/weight/sensor_2";
   topic = topic + sensorID;
+  topic2 = topic2 + sensorID;
   client.publish(topic.c_str(), reinterpret_cast<uint8_t *>(&displayedWeight), sizeof(float));
+  client.publish(topic2.c_str(), reinterpret_cast<uint8_t *>(&displayedWeight2), sizeof(float));
 }
 
 void handleNewWeightData()
@@ -257,9 +311,41 @@ void handleNewWeightData()
     publishWeightToMQTT();
   }
   displayWeight();
-  Serial.print("Load_cell output val: ");
+  Serial.print("Load_cell 1 output val: ");
   Serial.println(newWeight);
 }
+
+void handleNewWeightData2() {
+  newDataReady2 = 0;
+  int newWeight2 = static_cast<int>(LoadCell2.getData());
+  bool smallDelta2 = abs(newWeight2 - displayedWeight2) <= 2;
+  bool largeDelta2 = abs(newWeight2 - lastWeight2) >= 3;
+  
+  if (!firstMeasurement2) {
+    if (largeDelta2) {
+      displayWeight();
+    }
+    lastWeight2 = newWeight2;
+    if (smallDelta2 || largeDelta2) {
+      return;
+    }
+  } else {
+    firstMeasurement2 = false;
+    lastWeight2 = newWeight2;
+  }
+  
+  if (newWeight2 <= 2) {
+    newWeight2 = 0;
+  }
+  displayedWeight2 = newWeight2;
+  if (serviceEnabled) {
+    publishWeightToMQTT();
+  }
+  displayWeight();
+  Serial.print("Load_cell 2 output val: ");
+  Serial.println(newWeight2);
+}
+
 
 void reconnect()
 {
@@ -299,24 +385,36 @@ void loop()
     client.loop();
   }
   // get smoothed value from the dataset:
-  if (newDataReady)
+  if (newDataReady2)
   {
-    if (millis() > t + serialPrintInterval)
-    {
-      handleNewWeightData();
-      t = millis();
-    }
+    handleNewWeightData2(); 
   }
+
+    if (newDataReady)
+    {
+    //if (millis() > t + serialPrintInterval)
+    //{
+      handleNewWeightData(); 
+    //  t = millis();
+    //}
+  }
+
 
   if (Serial.available() > 0)
   {
     char inByte = Serial.read();
     if (inByte == 't')
       LoadCell.tareNoDelay();
+      LoadCell2.tareNoDelay();
   }
 
   if (LoadCell.getTareStatus())
   {
     Serial.println("Tare complete");
+  }
+
+  if (LoadCell2.getTareStatus()) 
+  {
+  Serial.println("LoadCell 2 Tare complete");
   }
 }
